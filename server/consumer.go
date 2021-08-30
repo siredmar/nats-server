@@ -846,7 +846,7 @@ func (o *consumer) handleClusterConsumerInfoRequest(sub *subscription, c *client
 }
 
 // Lock should be held.
-func (o *consumer) subscribeInternal(subject string, cb msgHandler) (*subscription, error) {
+func (o *consumer) subscribeInternal(subject string, cb internalMsgHandler) (*subscription, error) {
 	c := o.client
 	if c == nil {
 		return nil, fmt.Errorf("invalid consumer")
@@ -861,7 +861,7 @@ func (o *consumer) subscribeInternal(subject string, cb msgHandler) (*subscripti
 	o.sid++
 
 	// Now create the subscription
-	return c.processSub([]byte(subject), nil, []byte(strconv.Itoa(o.sid)), cb, false)
+	return c.processSub([]byte(subject), nil, []byte(strconv.Itoa(o.sid)), wrapIntoMsgHandler(cb), false)
 }
 
 // Unsubscribe from our subscription.

@@ -1913,7 +1913,7 @@ func (t *streamTemplate) createTemplateSubscriptions() error {
 	return nil
 }
 
-func (t *streamTemplate) processInboundTemplateMsg(_ *subscription, pc *client, acc *Account, subject, reply string, msg []byte) {
+func (t *streamTemplate) processInboundTemplateMsg(_ *subscription, pc *client, acc *Account, subject, reply string, msg []byte, tCtx *traceCtx) {
 	if t == nil || t.jsa == nil {
 		return
 	}
@@ -1956,7 +1956,7 @@ func (t *streamTemplate) processInboundTemplateMsg(_ *subscription, pc *client, 
 	}
 
 	// Process this message directly by invoking mset.
-	mset.processInboundJetStreamMsg(nil, pc, acc, subject, reply, msg)
+	mset.processInboundJetStreamMsg(nil, pc, acc, subject, reply, msg, tCtx)
 }
 
 // lookupStreamTemplate looks up the names stream template.
