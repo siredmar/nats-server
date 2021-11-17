@@ -243,14 +243,16 @@ type sessPersistRecord struct {
 }
 
 type mqttJSA struct {
-	mu      sync.Mutex
-	id      string
-	c       *client
-	sendq   chan *mqttJSPubMsg
-	rplyr   string
-	replies sync.Map
-	nuid    *nuid.NUID
-	quitCh  chan struct{}
+	mu        sync.Mutex
+	id        string
+	c         *client
+	sendq     chan *mqttJSPubMsg
+	rplyr     string
+	replies   sync.Map
+	nuid      *nuid.NUID
+	quitCh    chan struct{}
+	domain    string // Domain or possibly empty. This is added to session subject.
+	domainSet bool   // covers if domain was set, even to empty
 }
 
 type mqttJSPubMsg struct {
@@ -919,7 +921,6 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 
 	id := string(getHash(s.Name()))
 	replicas := s.mqttDetermineReplicas()
-	s.Noticef("Creating MQTT streams/consumers with replicas %v for account %q", replicas, accName)
 	as := &mqttAccountSessionManager{
 		sessions:   make(map[string]*mqttSession),
 		sessByHash: make(map[string]*mqttSession),
@@ -939,9 +940,37 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		},
 	}
 	// TODO record domain name in as here
+
+	// The domain to communicate with may be required for JS calls.
+	// Search from specific (per account setting) to generic (mqtt setting)
+	opts := s.getOpts()
+	if opts.JsAccDefaultDomain != nil {
+		if d, ok := opts.JsAccDefaultDomain[accName]; ok {
+			if d != _EMPTY_ {
+				as.jsa.domain = d
+			}
+			as.jsa.domainSet = true
+		}
+		// in case domain was set to empty, check if there are more generic domain overwrites
+	}
+	if as.jsa.domain == _EMPTY_ {
+		if d := opts.MQTT.JsDomain; d != _EMPTY_ {
+			as.jsa.domain = d
+			as.jsa.domainSet = true
+		}
+	}
 	// We need to include the domain in the subject prefix used to store sessions in the $MQTT_sess stream.
-	if d := s.getOpts().JetStreamDomain; d != _EMPTY_ {
+	if as.jsa.domainSet {
+		if as.jsa.domain != _EMPTY_ {
+			as.domainTk = as.jsa.domain + "."
+		}
+	} else if d := s.getOpts().JetStreamDomain; d != _EMPTY_ {
 		as.domainTk = d + "."
+	}
+	if as.jsa.domainSet {
+		s.Noticef("Creating MQTT streams/consumers with replicas %v for account %q in domain %q", replicas, accName, as.jsa.domain)
+	} else {
+		s.Noticef("Creating MQTT streams/consumers with replicas %v for account %q", replicas, accName)
 	}
 
 	var subs []*subscription
@@ -1145,6 +1174,16 @@ func (jsa *mqttJSA) newRequest(kind, subject string, hdr int, msg []byte) (inter
 	return jsa.newRequestEx(kind, subject, hdr, msg, mqttJSAPITimeout)
 }
 
+func (jsa *mqttJSA) prefixDomain(subject string) string {
+	if jsa.domain != _EMPTY_ {
+		// rewrite js api prefix with domain
+		if sub := strings.TrimPrefix(subject, JSApiPrefix+"."); sub != subject {
+			subject = fmt.Sprintf("$JS.%s.API.%s", jsa.domain, sub)
+		}
+	}
+	return subject
+}
+
 func (jsa *mqttJSA) newRequestEx(kind, subject string, hdr int, msg []byte, timeout time.Duration) (interface{}, error) {
 	jsa.mu.Lock()
 	// Either we use nuid.Next() which uses a global lock, or our own nuid object, but
@@ -1161,6 +1200,7 @@ func (jsa *mqttJSA) newRequestEx(kind, subject string, hdr int, msg []byte, time
 	ch := make(chan interface{}, 1)
 	jsa.replies.Store(reply, ch)
 
+	subject = jsa.prefixDomain(subject)
 	jsa.sendq <- &mqttJSPubMsg{
 		subj:  subject,
 		reply: reply,
@@ -1289,14 +1329,15 @@ func (jsa *mqttJSA) storeMsgWithKind(kind, subject string, headers int, msg []by
 func (jsa *mqttJSA) deleteMsg(stream string, seq uint64, wait bool) error {
 	dreq := JSApiMsgDeleteRequest{Seq: seq, NoErase: true}
 	req, _ := json.Marshal(dreq)
+	subj := jsa.prefixDomain(fmt.Sprintf(JSApiMsgDeleteT, stream))
 	if !wait {
 		jsa.sendq <- &mqttJSPubMsg{
-			subj: fmt.Sprintf(JSApiMsgDeleteT, stream),
+			subj: subj,
 			msg:  req,
 		}
 		return nil
 	}
-	dmi, err := jsa.newRequest(mqttJSAMsgDelete, fmt.Sprintf(JSApiMsgDeleteT, stream), 0, req)
+	dmi, err := jsa.newRequest(mqttJSAMsgDelete, subj, 0, req)
 	if err != nil {
 		return err
 	}
@@ -1598,7 +1639,8 @@ func (as *mqttAccountSessionManager) createSubscription(subject string, cb msgHa
 // No lock held on entry.
 func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, accName string, closeCh chan struct{}) {
 	var cluster string
-	if s.JetStreamEnabled() {
+	if s.JetStreamEnabled() && !as.jsa.domainSet {
+		// Only request the own cluster when it is clear that
 		cluster = s.cachedClusterName()
 	}
 	as.mu.RLock()
@@ -2216,7 +2258,7 @@ func (sess *mqttSession) clear() error {
 	sess.mu.Unlock()
 
 	for _, dur := range durs {
-		sess.jsa.sendq <- &mqttJSPubMsg{subj: fmt.Sprintf(JSApiConsumerDeleteT, mqttStreamName, dur)}
+		sess.jsa.sendq <- &mqttJSPubMsg{subj: sess.jsa.prefixDomain(fmt.Sprintf(JSApiConsumerDeleteT, mqttStreamName, dur))}
 	}
 	if seq > 0 {
 		if err := sess.jsa.deleteMsg(mqttSessStreamName, seq, true); err != nil {
@@ -2369,7 +2411,7 @@ func (sess *mqttSession) deleteConsumer(cc *ConsumerConfig) {
 	sess.mu.Lock()
 	sess.tmaxack -= cc.MaxAckPending
 	sess.mu.Unlock()
-	sess.jsa.sendq <- &mqttJSPubMsg{subj: fmt.Sprintf(JSApiConsumerDeleteT, mqttStreamName, cc.Durable)}
+	sess.jsa.sendq <- &mqttJSPubMsg{subj: sess.jsa.prefixDomain(fmt.Sprintf(JSApiConsumerDeleteT, mqttStreamName, cc.Durable))}
 }
 
 //////////////////////////////////////////////////////////////////////////////
